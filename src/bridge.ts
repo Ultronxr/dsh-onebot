@@ -33,7 +33,7 @@ import type { OutboundSegment, SendOptions } from './outbound.js'
 import { ChatRegistry } from './registry.js'
 import type { ChatAgent } from './registry.js'
 import { InboundPipeline, normalizeOneBot11 } from './inbound.js'
-import type { NormalizedInbound } from './inbound.js'
+import type { NormalizedInbound, QuotedMessageData } from './inbound.js'
 import { InterimTracker } from './interim.js'
 import { DeferredDelivery } from './deferred.js'
 import { DEFAULT_DEFERRED_TIMEOUT_MS } from './deferred.js'
@@ -356,7 +356,7 @@ export class ChatBridge {
       steerTranscript: (chatId, text) => this.steerTranscript(chatId, text),
       tryHandleCommand: (chatId, text, userId, nickname) => this.tryHandleCommand(chatId, text, userId, nickname),
       buildBody: (text, media, chatId) => this.buildBody(text, media, chatId),
-      expandQuote: messageId => this.expandQuote(messageId),
+      expandQuote: (messageId, verifiedData) => this.expandQuote(messageId, verifiedData),
       dispatchFollowup: (chatId, text, role, nickname) => this.dispatchFollowup(chatId, text, role, nickname),
       interceptBusyTurn: (chatId, text, role, nickname, plain) => this.interceptBusyTurn(chatId, text, role, nickname, plain),
       sendToChat: (chatId, text) => this.sendToChat(chatId, text),
@@ -862,9 +862,9 @@ export class ChatBridge {
     return true
   }
 
-  /** Expand a quoted (reply) message into [引用] text via get_msg. */
-  private expandQuote(messageId: string): Promise<string> {
-    return this.inbound.expandQuote(messageId)
+  /** Expand a quote, forwarding a verified response without repeating get_msg. */
+  private expandQuote(messageId: string, verifiedData?: QuotedMessageData): Promise<string> {
+    return this.inbound.expandQuote(messageId, verifiedData)
   }
 
   // ------------------------------------------------------------ outbound

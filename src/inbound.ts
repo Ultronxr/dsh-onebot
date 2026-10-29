@@ -19,7 +19,7 @@ import { extForInboundName } from './media.js'
 import type { Transcriber } from './stt.js'
 import { transcriptLabel } from './stt.js'
 import type { OneBotSegment, MediaRef } from './cq.js'
-import { cqUnescape, detectMention, parseMessage, segmentText } from './cq.js'
+import { cqUnescape, detectExplicitMention, detectMention, parseMessage, segmentText } from './cq.js'
 import type { AccessPolicyConfig, ChatId, UserRole } from './chat.js'
 import {
   buildChatId, buildGroupMessagePrefix, classifyUserRole, dmAllowed, groupAllowed,
@@ -66,6 +66,13 @@ export interface NormalizedInbound {
    * sanitized; the pipeline's M3-D5 identity whitelist sanitizes it before it
    * reaches the prefix, the boundary attribute or lastNickname. */
   nickname: string
+}
+
+/** The get_msg fields needed to verify a reply author and expand its text. */
+export interface QuotedMessageData {
+  message?: unknown
+  raw_message?: string
+  sender?: { user_id?: string | number; nickname?: string }
 }
 
 /**
@@ -158,8 +165,9 @@ export interface InboundContext {
   tryHandleCommand(chatId: ChatId, text: string, userId: string, nickname?: string): Promise<boolean>
   /** Message body assembly (bridge facade: overridable, see the pipeline-order test). */
   buildBody(text: string, media: MediaRef[], chatId: ChatId): Promise<string>
-  /** Quote (reply) expansion (bridge facade: overridable, see the pipeline-order test). */
-  expandQuote(messageId: string): Promise<string>
+  /** Quote expansion via the overridable bridge facade; a verified response
+   * is reused for reply-only triggers instead of querying the same id twice. */
+  expandQuote(messageId: string, verifiedData?: QuotedMessageData): Promise<string>
   /** Turn dispatch — bridge-owned orchestration (ensureChat + per-turn prefixes). */
   dispatchFollowup(chatId: ChatId, text: string, role: UserRole, nickname?: string): Promise<void>
   /** T2 (P1): busy-turn policy seam — invoked for every non-command message
@@ -251,7 +259,24 @@ export class InboundPipeline {
       }
     }
 
-    const mentioned = detectMention(inbound.segments, inbound.raw, this.ctx.selfId(), this.ctx.config.botQQ)
+    let mentioned = detectMention(inbound.segments, inbound.raw, this.ctx.selfId(), this.ctx.config.botQQ)
+    let verifiedQuote: QuotedMessageData | undefined
+    if (kind === 'group' && this.ctx.config.requireMention
+      && !detectExplicitMention(inbound.segments, inbound.raw, this.ctx.selfId(), this.ctx.config.botQQ)) {
+      mentioned = false
+      const bot = this.ctx.selfId() || this.ctx.config.botQQ
+      if (bot !== '' && inbound.replyId !== undefined) {
+        try {
+          // The reply segment's optional qq is not authoritative. Resolve the
+          // original author before commands, media I/O or busy-turn dispatch.
+          verifiedQuote = await this.ctx.call('get_msg', { message_id: Number(inbound.replyId) }) as QuotedMessageData | undefined
+          mentioned = String(verifiedQuote?.sender?.user_id ?? '') === bot
+        } catch (error) {
+          // Deleted/unknown quotes and lookup failures must never wake the bot.
+          this.ctx.log('debug', '引用作者校验失败，未唤醒机器人: ' + describeError(error))
+        }
+      }
+    }
     if (kind === 'group' && this.ctx.config.requireMention && !mentioned) {
       this.ctx.log('debug', 'ignoring unmentioned group message in ' + groupId)
       currentTrace()?.emit('mention', { ok: false, reason: TRACE_REASONS.inboundUnmentioned })
@@ -278,11 +303,9 @@ export class InboundPipeline {
     // Fire-and-forget temp cleanup on each inbound.
     void this.ctx.media.cleanupExpired()
 
-    // C6a: route slash commands BEFORE any media/quote I/O — a message that
-    // happens to carry media must not pay for downloads or get_msg calls just
-    // to be consumed as a command (admin-only; unknown /-words still fall
-    // through to the model). The most recent inbound image is registered from
-    // parsed.media up front so /ocr still sees it (resolved lazily there).
+    // Route commands before media/quote expansion. A reply-only group trigger
+    // must already have passed author verification above; explicit @ commands
+    // and private commands still avoid quote I/O. Register images lazily for /ocr.
     for (const ref of inbound.media) {
       if (ref.kind === 'image') this.ctx.getSettings(chatId).pendingImageRef = ref
     }
@@ -295,7 +318,8 @@ export class InboundPipeline {
 
     let quote = ''
     if (inbound.replyId !== undefined) {
-      quote = await this.ctx.expandQuote(inbound.replyId)
+      // Keep the bridge's expansion seam while reusing this message's lookup.
+      quote = await this.ctx.expandQuote(inbound.replyId, verifiedQuote)
     }
     let forward = ''
     if (inbound.forwardId !== undefined) {
@@ -498,14 +522,16 @@ export class InboundPipeline {
     }
   }
 
-  /** Expand a quoted (reply) message into [引用] text via get_msg. */
-  async expandQuote(messageId: string): Promise<string> {
+  /**
+   * Expand a quote through get_msg, or reuse its already verified response.
+   * @param messageId - quoted OneBot message id.
+   * @param verifiedData - optional response fetched by this inbound message's gate.
+   * @returns the existing [引用] text, or an empty string when expansion fails.
+   */
+  async expandQuote(messageId: string, verifiedData?: QuotedMessageData): Promise<string> {
     try {
-      const data = await this.ctx.call('get_msg', { message_id: Number(messageId) }) as {
-        message?: unknown
-        raw_message?: string
-        sender?: { nickname?: string }
-      }
+      // Local to one message: no cross-chat cache or shared mutable quote state.
+      const data = verifiedData ?? await this.ctx.call('get_msg', { message_id: Number(messageId) }) as QuotedMessageData
       const segments = Array.isArray(data.message) ? data.message as OneBotSegment[] : undefined
       const raw = typeof data.raw_message === 'string' ? data.raw_message : ''
       const text = cqUnescape(segmentText(segments, raw))

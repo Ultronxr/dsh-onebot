@@ -877,3 +877,11 @@ docker restart 会丢登录态（需重新扫码/QCE 登录）
 - **清单同步**：package.json version 0.9.5→0.9.6；dsh.plugin.json 同步 0.9.6；tests/commands.spec.ts packageVersion 断言随版更新为 0.9.6（it 描述串 + expect 两行，仿 0.9.3/0.9.4/0.9.5 发版先例）；package-lock.json 沿用既有惯例不动。
 - **发布面收口**：commit → push origin main（同批带上此前未推送的 `ac5c80a`）→ tag `v0.9.6` → GitHub Release → npm publish → npmmirror 同步 → profile web 升级 0.9.6；同批**补建历史缺失的 v0.9.4 / v0.9.5 GitHub Release**（只建 Release，不新建、不覆盖既有 tag）。宿主进程未重启，0.9.6 随宿主下次重启生效。
 
+## 2026-10-29 群聊引用消息误唤醒修复
+
+- **根因**：OneBot 11 的标准 `reply` 段只有消息 `id`，NapCat 与 SnowLuma 均可上报此格式。原 `detectMention` 将缺少 `qq` 的引用直接当作提及，导致引用群友的消息（包括同时 @其他群友）也通过 `requireMention`，随后进入模型或忙碌队列。
+- **修复**：拆分显式 @ 检测；群策略通过后，仅靠引用触发的消息必须由 `get_msg.sender.user_id` 确认为机器人原消息，作者未知、查询失败或作者为其他人均静默拒绝。引用段可选的 `qq` 不替代查询结果；显式 @机器人、@全体、私聊及 `requireMention: false` 的入口保持原有行为。
+- **引用展开契约**：校验结果通过可选参数传递给原 `expandQuote` 桥接门面，在保留覆写入口及单参数调用的同时复用一次查询；拒绝发生在命令、媒体、会话缓冲重置及排队/插话之前，无共享引用缓存。同步 TypeScript 源码、`lib` JS/声明及双语配置/排障说明，不调整版本号。
+- **验证**：Windows / Node v24.11.1；`tsc --noEmit -p tsconfig.json` 与默认 `lib` 目录编译通过；`vitest run tests/cq.spec.ts tests/reply-mention.spec.ts --maxWorkers=1` 为 46/46 通过（新增 33 项：引用测试 31 项 + CQ 测试 2 项）；桥接管线顺序测试补充仅引用机器人的场景，验证门面仍被调用且 `get_msg` 仅一次，通过。
+- **全量与基线对照**：`vitest run --dir tests --maxWorkers=1` 为 551 通过 / 24 失败 / 8 跳过。以未修改的 `bc3aa23` 导出基线、复用相同依赖执行全量，为 517 通过 / 25 失败 / 8 跳过；补丁版的 24 个失败用例全部也在基线失败，未新增失败用例。失败涉及默认 CJK 字体不可用、Windows 路径/POSIX 执行权限及 STT 脚本假设、客户端 bundle 契约、连接重试/端口时序；基线还多一次连接替换时序失败。本修复未改动这些功能，也未连接真实 QQ 或调用真实模型。
+

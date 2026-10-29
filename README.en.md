@@ -168,7 +168,7 @@ default). Common options:
 | `accessToken` | empty | OneBot token; **required in reverse mode** — the plugin refuses to start when left empty (fail-closed); may stay empty in forward mode |
 | `botQQ` | empty | bot QQ (empty = auto-learned) |
 | `ignoreSelf` | `true` | Ignore messages sent by the bot itself (prevents self-loops) |
-| `requireMention` | `true` | groups only respond when @-mentioned or replying to the bot's own messages (replies to other members don't trigger; when the replied-to message can't be determined, it falls back to counting as mentioned, fail-open) |
+| `requireMention` | `true` | groups respond to an explicit @ or a reply to the bot; reply-only triggers verify the original author through `get_msg.sender.user_id`. Replies to others, unknown authors and lookup failures do not trigger (fail-closed). Explicit @bot remains independent of quote lookup |
 | `rateLimitPerMinute` | `30` | per-chat cap on ordinary messages per minute (60s sliding window): over-limit messages are skipped with a rate-limit notice (at most one per window); commands are exempt; `0` disables |
 | `dedupWindowSeconds` | `300` | inbound message dedup window (seconds, W2-②): within the window a redelivered message with the same message_id in the same chat is processed only once; later duplicates are silently skipped with a debug log; applies only to message events that trigger reply handling (notice/meta events never reach this gate); `0` disables dedup |
 | `actionRatePerMinute` | `20` | bridge-wide per-minute cap on proactive writes (W2-③): covers proactive sends initiated by tools such as qq_send_image/voice/video/file/segments and qq_send_forward (in-turn passive replies/interim/notifications are not gated — they are bounded by rateLimitPerMinute and the offline-queue cap); over-limit sends are rejected with a warn and an audit entry; `0` disables the per-minute cap |
@@ -446,7 +446,7 @@ Lessons ported from the source DEVLOG:
 
 | Symptom | Cause & fix |
 |---|---|
-| Group chat not responding | With `requireMention: true`, @ or reply-to-the-bot is required; @ detection is fail-closed; make sure botQQ was learned from meta events or configured explicitly |
+| Group chat not responding | With `requireMention: true`, @ or reply-to-the-bot is required; make sure botQQ was learned from events or configured explicitly. Reply-only triggers also require `get_msg` to confirm the bot as the original author; explicitly @ the bot if the original message is unavailable or lookup fails |
 | Image download 403 | NapCat escapes `&` in URLs to `&amp;` (parsing unescapes automatically); if it still fails, check the media download line in the log |
 | File receive fails | NapCat on a different machine needs the "file-to-URL" switch on, otherwise `get_file` returns an unreachable container path; confirm dsh ↔ NapCat network connectivity |
 | Tofu CJK in text images | Linux without CJK fonts: `apt install fonts-noto-cjk`, and point `fontFiles` at an SC font file |
