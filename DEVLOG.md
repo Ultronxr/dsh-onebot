@@ -881,7 +881,14 @@ docker restart 会丢登录态（需重新扫码/QCE 登录）
 
 - **根因**：OneBot 11 的标准 `reply` 段只有消息 `id`，NapCat 与 SnowLuma 均可上报此格式。原 `detectMention` 将缺少 `qq` 的引用直接当作提及，导致引用群友的消息（包括同时 @其他群友）也通过 `requireMention`，随后进入模型或忙碌队列。
 - **修复**：拆分显式 @ 检测；群策略通过后，仅靠引用触发的消息必须由 `get_msg.sender.user_id` 确认为机器人原消息，作者未知、查询失败或作者为其他人均静默拒绝。引用段可选的 `qq` 不替代查询结果；显式 @机器人、@全体、私聊及 `requireMention: false` 的入口保持原有行为。
-- **引用展开契约**：校验结果通过可选参数传递给原 `expandQuote` 桥接门面，在保留覆写入口及单参数调用的同时复用一次查询；拒绝发生在命令、媒体、会话缓冲重置及排队/插话之前，无共享引用缓存。同步 TypeScript 源码、`lib` JS/声明及双语配置/排障说明，不调整版本号。
+- **引用展开契约**：校验结果通过可选参数传递给原 `expandQuote` 桥接门面，在保留覆写入口及单参数调用的同时复用一次查询；拒绝发生在命令、媒体、会话缓冲重置及排队/插话之前，无共享引用缓存。同步 TypeScript 源码及双语配置/排障说明，不调整版本号；`lib/` 产物按 10 月 30 日评审跟进从 PR 最终差异中排除，由维护者发版构建生成。
 - **验证**：Windows / Node v24.11.1；`tsc --noEmit -p tsconfig.json` 与默认 `lib` 目录编译通过；`vitest run tests/cq.spec.ts tests/reply-mention.spec.ts --maxWorkers=1` 为 46/46 通过（新增 33 项：引用测试 31 项 + CQ 测试 2 项）；桥接管线顺序测试补充仅引用机器人的场景，验证门面仍被调用且 `get_msg` 仅一次，通过。
 - **全量与基线对照**：`vitest run --dir tests --maxWorkers=1` 为 551 通过 / 24 失败 / 8 跳过。以未修改的 `bc3aa23` 导出基线、复用相同依赖执行全量，为 517 通过 / 25 失败 / 8 跳过；补丁版的 24 个失败用例全部也在基线失败，未新增失败用例。失败涉及默认 CJK 字体不可用、Windows 路径/POSIX 执行权限及 STT 脚本假设、客户端 bundle 契约、连接重试/端口时序；基线还多一次连接替换时序失败。本修复未改动这些功能，也未连接真实 QQ 或调用真实模型。
+
+## 2026-10-30 PR #10 评审跟进：引用 ID 校验与诊断
+
+- **ID 校验**：作者校验和引用展开共用 `numericReplyId`，在 `Number()` 前检查十进制整数格式，再以 `Number.isSafeInteger` 拒绝精度丢失与溢出，避免发送 NaN/无效查询。保留负数 int32、可精确表示的较大适配器 ID，以及适配器直接上报数字类型引用字段的现有路径；无效引用在显式 @、私聊及 `requireMention: false` 下只跳过展开，不阻断当前消息。
+- **诊断与成本**：沿用 `mention` trace 阶段，细分无效 ID、查询失败或空响应、作者缺失、作者非机器人；普通未提及保留原原因。原因使用固定常量，保留 trace 的同原因限频机制。双语 README 补充群友互引也会查询、查询在 `rateLimitPerMinute` 之前、单消息复用且当前无跨消息缓存的成本说明，不调整门控顺序或引入缓存。
+- **测试与编译**：新增 34 项 ID/兼容性测试，引用门控套件由 31 项增至 65 项，并在已有拒绝矩阵中断言细分 trace 原因。`vitest run tests/cq.spec.ts tests/reply-mention.spec.ts tests/trace.spec.ts tests/inbound.spec.ts tests/record-replay.spec.ts tests/steer-queue.spec.ts --maxWorkers=1` 为 6 文件 / 148 项全部通过；桥接 `inbound pipeline order` 定向测试 1 项通过（其余 15 项因筛选未执行）。`tsc -p tsconfig.json` 默认目录编译通过。本轮未重跑全量，上节全量对照是 10 月 29 日版本的记录；未调用真实 QQ/LLM。
+- **产物边界**：验证编译后，将受跟踪的 `lib/` 还原为原 PR 基线 `bc3aa23`；分支相对该基线的 `lib/` 最终差异为空，由维护者发版构建统一生成。需要从源码运行本修复时先构建。保留原提交，使用追加提交承接评审修改。
 

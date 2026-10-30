@@ -261,25 +261,42 @@ export class InboundPipeline {
 
     let mentioned = detectMention(inbound.segments, inbound.raw, this.ctx.selfId(), this.ctx.config.botQQ)
     let verifiedQuote: QuotedMessageData | undefined
+    let mentionDropReason: string = TRACE_REASONS.inboundUnmentioned
     if (kind === 'group' && this.ctx.config.requireMention
       && !detectExplicitMention(inbound.segments, inbound.raw, this.ctx.selfId(), this.ctx.config.botQQ)) {
       mentioned = false
       const bot = this.ctx.selfId() || this.ctx.config.botQQ
       if (bot !== '' && inbound.replyId !== undefined) {
-        try {
-          // The reply segment's optional qq is not authoritative. Resolve the
-          // original author before commands, media I/O or busy-turn dispatch.
-          verifiedQuote = await this.ctx.call('get_msg', { message_id: Number(inbound.replyId) }) as QuotedMessageData | undefined
-          mentioned = String(verifiedQuote?.sender?.user_id ?? '') === bot
-        } catch (error) {
-          // Deleted/unknown quotes and lookup failures must never wake the bot.
-          this.ctx.log('debug', '引用作者校验失败，未唤醒机器人: ' + describeError(error))
+        const messageId = numericReplyId(inbound.replyId)
+        if (messageId === undefined) {
+          mentionDropReason = TRACE_REASONS.quoteInvalidId
+        } else {
+          try {
+            // The reply segment's optional qq is not authoritative. Resolve the
+            // original author before commands, media I/O or busy-turn dispatch.
+            verifiedQuote = await this.ctx.call('get_msg', { message_id: messageId }) as QuotedMessageData | undefined
+            const author = String(verifiedQuote?.sender?.user_id ?? '')
+            mentioned = author === bot
+            // Stable reasons preserve trace same-cause dedup while distinguishing
+            // an unavailable original from missing or non-bot author information.
+            if (verifiedQuote == null) {
+              mentionDropReason = TRACE_REASONS.inboundReplyLookupFailed
+            } else if (author === '') {
+              mentionDropReason = TRACE_REASONS.inboundReplyAuthorUnknown
+            } else if (!mentioned) {
+              mentionDropReason = TRACE_REASONS.inboundReplyOtherAuthor
+            }
+          } catch (error) {
+            // Deleted/unknown quotes and lookup failures must never wake the bot.
+            mentionDropReason = TRACE_REASONS.inboundReplyLookupFailed
+            this.ctx.log('debug', '引用作者校验失败，未唤醒机器人: ' + describeError(error))
+          }
         }
       }
     }
     if (kind === 'group' && this.ctx.config.requireMention && !mentioned) {
-      this.ctx.log('debug', 'ignoring unmentioned group message in ' + groupId)
-      currentTrace()?.emit('mention', { ok: false, reason: TRACE_REASONS.inboundUnmentioned })
+      this.ctx.log('debug', mentionDropReason + ': ' + groupId)
+      currentTrace()?.emit('mention', { ok: false, reason: mentionDropReason })
       return
     }
 
@@ -529,9 +546,17 @@ export class InboundPipeline {
    * @returns the existing [引用] text, or an empty string when expansion fails.
    */
   async expandQuote(messageId: string, verifiedData?: QuotedMessageData): Promise<string> {
+    const numericId = numericReplyId(messageId)
+    if (numericId === undefined) {
+      // An invalid quote must not block explicit @ / private entry points;
+      // omit only its expansion and avoid an unusable get_msg request.
+      this.ctx.log('debug', TRACE_REASONS.quoteInvalidId)
+      currentTrace()?.emit('quote', { ok: false, reason: TRACE_REASONS.quoteInvalidId })
+      return ''
+    }
     try {
       // Local to one message: no cross-chat cache or shared mutable quote state.
-      const data = verifiedData ?? await this.ctx.call('get_msg', { message_id: Number(messageId) }) as QuotedMessageData
+      const data = verifiedData ?? await this.ctx.call('get_msg', { message_id: numericId }) as QuotedMessageData
       const segments = Array.isArray(data.message) ? data.message as OneBotSegment[] : undefined
       const raw = typeof data.raw_message === 'string' ? data.raw_message : ''
       const text = cqUnescape(segmentText(segments, raw))
@@ -679,6 +704,21 @@ export class InboundPipeline {
       return { text: '[合并转发 id=' + forwardId + ' 未展开: api-error]', media: [] }
     }
   }
+}
+
+/**
+ * Parse a decimal reply id without producing NaN or rounding an integer.
+ * @param messageId - raw OneBot reply id (signed ids remain supported).
+ * @returns the exact numeric id, or undefined when no safe request can be made.
+ */
+function numericReplyId(messageId: string): number | undefined {
+  // Keep negative int32 ids and safe larger adapter ids; reject coercions such
+  // as empty strings, whitespace, hexadecimal, fractions and exponent notation.
+  // Some adapters send numeric segment fields despite the string-valued type.
+  const raw = String(messageId)
+  if (raw.trim() !== raw || !/^-?\d+$/.test(raw)) return undefined
+  const value = Number(raw)
+  return Number.isSafeInteger(value) ? value : undefined
 }
 
 /** The placeholder a media ref contributes to the parsed text. */

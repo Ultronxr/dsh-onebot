@@ -3,6 +3,8 @@ import type { OneBotEvent } from '../src/connection.js'
 import type { OneBotSegment } from '../src/cq.js'
 import { InboundPipeline, normalizeOneBot11 } from '../src/inbound.js'
 import type { InboundChat, InboundContext, QuotedMessageData } from '../src/inbound.js'
+import { runWithTrace, TRACE_REASONS } from '../src/trace.js'
+import type { TraceScope } from '../src/trace.js'
 
 const BOT = '10002'
 const OTHER = '10003'
@@ -20,6 +22,7 @@ interface HarnessOptions {
   command?: boolean
   config?: Partial<InboundContext['config']>
   policy?: Partial<InboundContext['policy']>
+  replyMessageId?: number
 }
 
 /** Build an isolated pipeline with in-memory API, command and dispatch stubs. */
@@ -31,7 +34,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const call = vi.fn(async (action: string, params: Record<string, unknown>) => {
     // No real OneBot server or outbound write action is reachable from this stub.
     expect(action).toBe('get_msg')
-    expect(params).toEqual({ message_id: 123 })
+    expect(params).toEqual({ message_id: options.replyMessageId ?? 123 })
     if (options.error) throw new Error(options.error)
     return response
   })
@@ -45,6 +48,8 @@ function makeHarness(options: HarnessOptions = {}) {
   const interceptBusyTurn = vi.fn(async (_id: string, _text: string, _role: string, _nickname: string | undefined, _plain: boolean) => options.busy === true)
   const dispatchFollowup = vi.fn(async (_id: string, _text: string) => undefined)
   const cleanupExpired = vi.fn(async () => undefined)
+  const emit = vi.fn<TraceScope['emit']>()
+  const trace: TraceScope = { traceId: 't-reply', chatId: 'group:888', messageId: '456', emit }
   let pipeline: InboundPipeline
   const expandQuote = vi.fn((id: string, verified?: QuotedMessageData) => pipeline.expandQuote(id, verified))
   pipeline = new InboundPipeline({
@@ -69,7 +74,7 @@ function makeHarness(options: HarnessOptions = {}) {
     },
   })
   return { pipeline, response, call, chat, sweepIdleChats, tryHandleCommand, buildBody,
-    expandQuote, interceptBusyTurn, dispatchFollowup, cleanupExpired }
+    expandQuote, interceptBusyTurn, dispatchFollowup, cleanupExpired, trace, emit }
 }
 
 /** Normalize a fake array/CQ event; raw_message mirrors string payloads. */
@@ -82,32 +87,28 @@ function inbound(message: OneBotSegment[] | string, overrides: Partial<OneBotEve
 }
 
 describe('reply-only group mention verification', () => {
-  const blocked: Array<{ name: string; message: OneBotSegment[] | string; options?: HarnessOptions }> = [
+  const blocked: Array<{ name: string; message: OneBotSegment[] | string; options?: HarnessOptions; reason?: string }> = [
     { name: 'reply id without an @', message: [reply, body] },
     { name: 'reply id plus @another member', message: [reply, atOther, body] },
     { name: 'reply.qq claims bot but get_msg names another author', message: [{ type: 'reply', data: { id: '123', qq: BOT } }, body] },
     { name: 'CQ reply id without an @', message: '[CQ:reply,id=123] body' },
     { name: 'CQ reply id plus @another member', message: `[CQ:reply,id=123][CQ:at,qq=${OTHER}] body` },
     { name: '@bot inside the quoted original only', message: [reply, body], options: { response: { sender: { user_id: OTHER }, message: [atBot, body] } } },
-    { name: 'deleted or unknown message', message: [reply, body], options: { error: 'message not found' } },
-    { name: 'lookup timeout', message: [reply, body], options: { error: 'OneBot call timed out' } },
-    { name: 'missing sender id', message: [reply, body], options: { response: { message: [body] } } },
-    { name: 'null lookup response', message: [reply, body], options: { response: null } },
+    { name: 'deleted or unknown message', message: [reply, body], options: { error: 'message not found' }, reason: TRACE_REASONS.inboundReplyLookupFailed },
+    { name: 'lookup timeout', message: [reply, body], options: { error: 'OneBot call timed out' }, reason: TRACE_REASONS.inboundReplyLookupFailed },
+    { name: 'missing sender id', message: [reply, body], options: { response: { message: [body] } }, reason: TRACE_REASONS.inboundReplyAuthorUnknown },
+    { name: 'null lookup response', message: [reply, body], options: { response: null }, reason: TRACE_REASONS.inboundReplyLookupFailed },
   ]
 
   for (const item of blocked) {
     it('blocks ' + item.name + ' before command/media/busy-turn side effects', async () => {
       const h = makeHarness(item.options)
-      await h.pipeline.processInbound(inbound(item.message))
+      await runWithTrace(h.trace, () => h.pipeline.processInbound(inbound(item.message)))
       expect(h.call).toHaveBeenCalledTimes(1)
-      expect(h.tryHandleCommand).not.toHaveBeenCalled()
-      expect(h.buildBody).not.toHaveBeenCalled()
-      expect(h.expandQuote).not.toHaveBeenCalled()
-      expect(h.sweepIdleChats).not.toHaveBeenCalled()
-      expect(h.cleanupExpired).not.toHaveBeenCalled()
-      expect(h.interceptBusyTurn).not.toHaveBeenCalled()
-      expect(h.dispatchFollowup).not.toHaveBeenCalled()
-      expect(h.chat.loopPending).toBe('old')
+      expectBlocked(h)
+      expect(h.emit).toHaveBeenCalledExactlyOnceWith('mention', {
+        ok: false, reason: item.reason ?? TRACE_REASONS.inboundReplyOtherAuthor,
+      })
     })
   }
 
@@ -184,9 +185,10 @@ describe('reply-only group mention verification', () => {
 describe('existing non-reply-trigger entry points', () => {
   it('does not add lookup I/O to an unmentioned ordinary group message', async () => {
     const h = makeHarness()
-    await h.pipeline.processInbound(inbound([body]))
+    await runWithTrace(h.trace, () => h.pipeline.processInbound(inbound([body])))
     expect(h.call).not.toHaveBeenCalled()
     expect(h.dispatchFollowup).not.toHaveBeenCalled()
+    expect(h.emit).toHaveBeenCalledExactlyOnceWith('mention', { ok: false, reason: TRACE_REASONS.inboundUnmentioned })
   })
 
   const explicit: Array<OneBotSegment[] | string> = [
@@ -231,5 +233,86 @@ describe('existing non-reply-trigger entry points', () => {
     await h.pipeline.processInbound(inbound([reply, body]))
     expect(h.call).toHaveBeenCalledTimes(1)
     expect(h.dispatchFollowup).toHaveBeenCalledTimes(1)
+  })
+})
+
+/** Assert that a rejected reply never reaches any downstream state or I/O seam. */
+function expectBlocked(h: ReturnType<typeof makeHarness>): void {
+  expect(h.tryHandleCommand).not.toHaveBeenCalled()
+  expect(h.buildBody).not.toHaveBeenCalled()
+  expect(h.expandQuote).not.toHaveBeenCalled()
+  expect(h.sweepIdleChats).not.toHaveBeenCalled()
+  expect(h.cleanupExpired).not.toHaveBeenCalled()
+  expect(h.interceptBusyTurn).not.toHaveBeenCalled()
+  expect(h.dispatchFollowup).not.toHaveBeenCalled()
+  expect(h.chat.loopPending).toBe('old')
+  expect(h.chat.loopBuffer).toHaveLength(1)
+}
+
+describe('reply id validation', () => {
+  // Exercise both wire formats; Number() alone accepts several of these inputs
+  // or silently rounds them, so no get_msg request may escape for any of them.
+  for (const id of ['', 'abc', '1.5', '1e3', '0x7b', ' 123 ', '123\n', 'NaN', 'Infinity', '9007199254740993', '9'.repeat(400)]) {
+    for (const format of ['array', 'CQ']) {
+      it(`rejects invalid ${format} reply id ${JSON.stringify(id)} without API or downstream effects`, async () => {
+        const h = makeHarness({ author: BOT })
+        const message = format === 'array'
+          ? [{ type: 'reply', data: { id } }, body] : `[CQ:reply,id=${id}] body`
+        await runWithTrace(h.trace, () => h.pipeline.processInbound(inbound(message)))
+        expect(h.call).not.toHaveBeenCalled()
+        expectBlocked(h)
+        expect(h.emit).toHaveBeenCalledExactlyOnceWith('mention', { ok: false, reason: TRACE_REASONS.quoteInvalidId })
+      })
+    }
+  }
+
+  for (const id of ['-123', '-2147483648', '9007199254740991']) {
+    for (const format of ['array', 'CQ']) {
+      it(`keeps valid ${format} signed/safe adapter id ${id} and reuses its single lookup`, async () => {
+        const h = makeHarness({ author: BOT, replyMessageId: Number(id) })
+        const message = format === 'array'
+          ? [{ type: 'reply', data: { id } }, body] : `[CQ:reply,id=${id}] body`
+        await runWithTrace(h.trace, () => h.pipeline.processInbound(inbound(message)))
+        expect(h.call).toHaveBeenCalledTimes(1)
+        expect(h.expandQuote).toHaveBeenCalledExactlyOnceWith(id, h.response)
+        expect(h.dispatchFollowup).toHaveBeenCalledTimes(1)
+        expect(h.emit).not.toHaveBeenCalled()
+      })
+    }
+  }
+
+  const existingEntries: Array<{ name: string; message: OneBotSegment[]; overrides?: Partial<OneBotEvent>; config?: HarnessOptions['config'] }> = [
+    { name: 'explicit @bot', message: [{ type: 'reply', data: { id: 'abc' } }, atBot, body] },
+    { name: 'private message', message: [{ type: 'reply', data: { id: 'abc' } }, body], overrides: { message_type: 'private' } },
+    { name: 'requireMention disabled', message: [{ type: 'reply', data: { id: 'abc' } }, body], config: { requireMention: false } },
+  ]
+  for (const id of [123, -123]) {
+    it(`accepts numeric adapter reply field ${id} before checking its author`, async () => {
+      const h = makeHarness({ author: BOT, replyMessageId: id })
+      // Real adapters may emit number-valued segment data; preserve that wire
+      // shape through normalization instead of casting it to a string fixture.
+      await h.pipeline.processInbound(inbound([body], {
+        message: [{ type: 'reply', data: { id } }, body],
+      }))
+      expect(h.call).toHaveBeenCalledTimes(1)
+      expect(h.dispatchFollowup).toHaveBeenCalledTimes(1)
+    })
+  }
+  for (const entry of existingEntries) {
+    it(`omits only the invalid quote for ${entry.name}, preserving the message entry point`, async () => {
+      const h = makeHarness({ config: entry.config })
+      await runWithTrace(h.trace, () => h.pipeline.processInbound(inbound(entry.message, entry.overrides)))
+      expect(h.call).not.toHaveBeenCalled()
+      expect(h.dispatchFollowup).toHaveBeenCalledTimes(1)
+      expect(h.dispatchFollowup.mock.calls[0][1]).toContain('reply body')
+      expect(h.emit).toHaveBeenCalledExactlyOnceWith('quote', { ok: false, reason: TRACE_REASONS.quoteInvalidId })
+    })
+  }
+
+  it('keeps the one-argument expansion entry point but skips invalid-id queries', async () => {
+    const h = makeHarness()
+    expect(await runWithTrace(h.trace, () => h.pipeline.expandQuote('abc'))).toBe('')
+    expect(h.call).not.toHaveBeenCalled()
+    expect(h.emit).toHaveBeenCalledExactlyOnceWith('quote', { ok: false, reason: TRACE_REASONS.quoteInvalidId })
   })
 })
